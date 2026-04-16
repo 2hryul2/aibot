@@ -2,10 +2,12 @@
 
 Monitors:
 1. Claude Desktop — via Windows notification DB polling (wpndatabase.db)
-2. KakaoTalk — via Win32 SetWinEventHook (EVA_Window_Dblclk CREATE event)
+2. KakaoTalk — via PID-scoped SetWinEventHook (KakaoTalkShadowWndClass CREATE)
+
+Runs as a system tray icon with right-click menu (Start/Stop/Quit).
 
 Usage:
-  python notification_watcher.py            Run the watcher
+  python notification_watcher.py            Run with tray icon
   python notification_watcher.py --install   Register as startup program
   python notification_watcher.py --uninstall Remove from startup
 """
@@ -22,6 +24,9 @@ import logging
 import threading
 
 import win32gui
+import win32process
+import pystray
+from PIL import Image
 
 user32 = ctypes.windll.user32
 
@@ -35,6 +40,7 @@ CLAUDE_HANDLER_ID = 404
 
 # KakaoTalk
 KAKAO_WINDOW_CLASS = "EVA_Window_Dblclk"
+KAKAO_SHADOW_CLASS = "KakaoTalkShadowWndClass"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(
@@ -55,7 +61,6 @@ logging.basicConfig(
 # ── WinEvent constants ──
 EVENT_OBJECT_CREATE = 0x8000
 WINEVENT_OUTOFCONTEXT = 0x0000
-WINEVENT_SKIPOWNPROCESS = 0x0002
 
 WINEVENTPROC = ctypes.WINFUNCTYPE(
     None,
@@ -68,18 +73,41 @@ WINEVENTPROC = ctypes.WINFUNCTYPE(
     ctypes.wintypes.DWORD,
 )
 
+# ── Watcher state ──
+_watcher_running = False
+_watcher_thread = None
+_stop_event = threading.Event()
+
+
+def _get_pythonw():
+    """Get pythonw.exe path (no console window) from current Python."""
+    exe_dir = os.path.dirname(sys.executable)
+    pythonw = os.path.join(exe_dir, "pythonw.exe")
+    if os.path.isfile(pythonw):
+        return pythonw
+    pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+    if os.path.isfile(pythonw):
+        return pythonw
+    return None
+
 
 def install_startup():
     """Register as Windows startup program via registry (HKCU)."""
     import winreg
     key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
     value_name = "ClaudeDitooNotifier"
-    command = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+
+    pythonw = _get_pythonw()
+    if pythonw:
+        command = f'"{pythonw}" "{os.path.abspath(__file__)}"'
+    else:
+        command = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
 
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
         winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, command)
         winreg.CloseKey(key)
+        logging.info(f"Startup registered: {command}")
         print(f"Startup registered: {value_name}")
         print(f"  Command: {command}")
     except Exception as e:
@@ -157,40 +185,33 @@ def send_to_ditoo(image_name, display_seconds=DITOO_DISPLAY_SECONDS):
 
 
 def send_to_ditoo_until_checked(image_name, check_window_class, interval=10, keyboard_effect=None):
-    """Send image to Ditoo repeatedly until user opens the target app.
-
-    Checks every `interval` seconds if the target window class is foreground.
-    When user opens the app (foreground), reverts to clock.
-    keyboard_effect: number of 'next' presses to reach desired LED effect (e.g. 2 for yellow snooze)
-    """
+    """Send image to Ditoo repeatedly until user opens the target app."""
     try:
         sys.path.insert(0, SCRIPT_DIR)
         from ditoo_connection import load_config, get_device, send_image, send_clock
 
         image_path = os.path.join(SCRIPT_DIR, image_name)
 
-        # 첫 전송
         config = load_config()
         device = get_device(config)
         send_image(device, image_path, config)
 
-        # 키보드 LED 켜기 + 효과 적용
         if keyboard_effect is not None:
             device.send_keyboard(0)  # toggle on
             time.sleep(0.1)
             for _ in range(keyboard_effect):
-                device.send_keyboard(1)  # next effect
+                device.send_keyboard(1)
                 time.sleep(0.1)
             logging.info(f"Keyboard LED: on + next x{keyboard_effect}")
 
         device.disconnect()
         logging.info(f"Ditoo: {image_name} sent (repeat until checked)")
 
-        # 사용자가 확인할 때까지 반복
-        while True:
-            time.sleep(interval)
+        while not _stop_event.is_set():
+            _stop_event.wait(interval)
+            if _stop_event.is_set():
+                break
 
-            # 포그라운드 창 확인
             fg = user32.GetForegroundWindow()
             try:
                 fg_class = win32gui.GetClassName(fg)
@@ -200,7 +221,6 @@ def send_to_ditoo_until_checked(image_name, check_window_class, interval=10, key
             except Exception:
                 pass
 
-            # 이미지 재전송 (화면 유지)
             try:
                 config = load_config()
                 device = get_device(config)
@@ -209,13 +229,11 @@ def send_to_ditoo_until_checked(image_name, check_window_class, interval=10, key
             except Exception:
                 pass
 
-        # 시계 복귀 + 키보드 LED 원복
         config = load_config()
         device = get_device(config)
         send_clock(device, style=0)
 
         if keyboard_effect is not None:
-            # 키보드 LED 끄기
             device.send_keyboard(0)  # toggle off
             logging.info("Keyboard LED: off (restored)")
 
@@ -226,19 +244,35 @@ def send_to_ditoo_until_checked(image_name, check_window_class, interval=10, key
         logging.error(f"Ditoo repeat failed: {e}")
 
 
-# ── KakaoTalk: SetWinEventHook (CREATE event) ──
+# ── KakaoTalk: PID-scoped ShadowWnd detection ──
 
 _kakao_last_notify = 0
 
 
+def find_kakao_pid():
+    """Find KakaoTalk main window and return its PID."""
+    result = []
+
+    def cb(hwnd, _):
+        if win32gui.IsWindowVisible(hwnd):
+            title = win32gui.GetWindowText(hwnd)
+            if "카카오톡" in title or "KakaoTalk" in title:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                result.append(pid)
+        return True
+
+    win32gui.EnumWindows(cb, None)
+    return result[0] if result else None
+
+
 def _on_win_event(hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
-    """Callback for KakaoTalk window CREATE event."""
+    """Callback for KakaoTalk ShadowWnd CREATE event (new message notification)."""
     global _kakao_last_notify
     try:
         if not hwnd:
             return
         cls = win32gui.GetClassName(hwnd)
-        if cls != KAKAO_WINDOW_CLASS:
+        if cls != KAKAO_SHADOW_CLASS:
             return
 
         now = time.time()
@@ -246,11 +280,8 @@ def _on_win_event(hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, 
             return
 
         _kakao_last_notify = now
-        logging.info("KakaoTalk CREATE event detected")
-        print(f"[{time.strftime('%H:%M:%S')}] KakaoTalk notification!")
+        logging.info("KakaoTalk ShadowWnd CREATE detected (new message)")
 
-        # Ditoo 전송은 별도 스레드 (메시지 펌프 블로킹 방지)
-        # 사용자가 카카오톡을 열 때까지 반복 표시 + 노란색 스누즈 키보드 효과
         threading.Thread(
             target=send_to_ditoo_until_checked,
             args=("kakao.bmp", KAKAO_WINDOW_CLASS),
@@ -274,7 +305,7 @@ def claude_poll_loop():
 
     last_claude_time = 0
 
-    while True:
+    while not _stop_event.is_set():
         now = time.time()
         try:
             if now - last_claude_time > COOLDOWN_SECONDS:
@@ -283,58 +314,136 @@ def claude_poll_loop():
                     nid, arrival = row
                     if last_claude_id is not None and nid != last_claude_id:
                         logging.info(f"New Claude notification: id={nid}")
-                        print(f"[{time.strftime('%H:%M:%S')}] Claude notification!")
                         send_to_ditoo("claude.bmp")
                         last_claude_time = time.time()
                     last_claude_id = nid
         except Exception as e:
             logging.error(f"Claude poll error: {e}")
 
-        time.sleep(CLAUDE_POLL_INTERVAL)
+        _stop_event.wait(CLAUDE_POLL_INTERVAL)
 
 
-# ── Main ──
+# ── Watcher core ──
 
-def watch():
-    """Run Claude DB polling + KakaoTalk event hook."""
-    global _kakao_last_notify
+def _watcher_main():
+    """Run Claude DB polling + KakaoTalk event hook in a thread."""
+    global _watcher_running
 
-    logging.info("Notification watcher started (Claude DB + KakaoTalk event hook)")
-    print("Notification watcher running... (Ctrl+C to stop)")
-    print(f"  Claude: DB polling every {CLAUDE_POLL_INTERVAL}s (HandlerId={CLAUDE_HANDLER_ID})")
-    print(f"  KakaoTalk: SetWinEventHook CREATE ({KAKAO_WINDOW_CLASS})")
+    logging.info("Notification watcher started")
+    _watcher_running = True
 
-    # Claude polling in background thread
+    kakao_pid = find_kakao_pid()
+    if kakao_pid:
+        logging.info(f"KakaoTalk PID={kakao_pid}")
+    else:
+        logging.warning("KakaoTalk not found at startup")
+
     claude_thread = threading.Thread(target=claude_poll_loop, daemon=True)
     claude_thread.start()
 
-    # KakaoTalk: install WinEvent hook (requires message pump on this thread)
     cb = WINEVENTPROC(_on_win_event)
-    hook = user32.SetWinEventHook(
-        EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE,
-        0, cb, 0, 0,
-        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-    )
-    if not hook:
-        logging.error("Failed to install WinEvent hook")
-        print("ERROR: Failed to install KakaoTalk event hook")
-        return
+    hook = None
+    if kakao_pid:
+        hook = user32.SetWinEventHook(
+            EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE,
+            0, cb, kakao_pid, 0,
+            WINEVENT_OUTOFCONTEXT,
+        )
+        if hook:
+            logging.info(f"KakaoTalk event hook installed (PID={kakao_pid})")
+        else:
+            logging.error("Failed to install KakaoTalk event hook")
 
-    logging.info("KakaoTalk event hook installed")
-
-    # Message pump (required for SetWinEventHook callbacks)
     msg = ctypes.wintypes.MSG()
-    try:
-        while user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) != 0:
+    while not _stop_event.is_set():
+        # PeekMessage with PM_REMOVE to avoid blocking forever
+        if user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, 0x0001):
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
-    except KeyboardInterrupt:
-        pass
-    finally:
-        user32.UnhookWinEvent(hook)
-        logging.info("Watcher stopped")
-        print("\nStopped.")
+        else:
+            time.sleep(0.1)
 
+    if hook:
+        user32.UnhookWinEvent(hook)
+    _watcher_running = False
+    logging.info("Watcher stopped")
+
+
+# ── Tray icon ──
+
+def _create_tray_icon():
+    """Create tray icon image (16x16 orange circle)."""
+    icon_path = os.path.join(SCRIPT_DIR, "claude_icon.png")
+    if os.path.isfile(icon_path):
+        return Image.open(icon_path).resize((64, 64), Image.Resampling.NEAREST)
+    # Fallback: generate simple icon
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([8, 8, 56, 56], fill=(0xCC, 0x66, 0x33, 0xFF))
+    return img
+
+
+def _on_start(icon, item):
+    """Start watching."""
+    global _watcher_thread
+    if _watcher_running:
+        return
+    _stop_event.clear()
+    _watcher_thread = threading.Thread(target=_watcher_main, daemon=True)
+    _watcher_thread.start()
+    icon.notify("Ditoo Watcher started", "Ditoo Notifier")
+    logging.info("Watcher started via tray")
+
+
+def _on_stop(icon, item):
+    """Stop watching."""
+    if not _watcher_running:
+        return
+    _stop_event.set()
+    icon.notify("Ditoo Watcher stopped", "Ditoo Notifier")
+    logging.info("Watcher stopped via tray")
+
+
+def _on_quit(icon, item):
+    """Quit the app."""
+    _stop_event.set()
+    icon.stop()
+    logging.info("Tray app quit")
+
+
+def _get_status(item):
+    """Dynamic menu label showing current status."""
+    return "Running" if _watcher_running else "Stopped"
+
+
+def run_tray():
+    """Run the notification watcher as a system tray icon."""
+    icon = pystray.Icon(
+        "ditoo_notifier",
+        _create_tray_icon(),
+        "Ditoo Notifier",
+        menu=pystray.Menu(
+            pystray.MenuItem(_get_status, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Start", _on_start),
+            pystray.MenuItem("Stop", _on_stop),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", _on_quit),
+        ),
+    )
+
+    # Auto-start watcher
+    _stop_event.clear()
+    global _watcher_thread
+    _watcher_thread = threading.Thread(target=_watcher_main, daemon=True)
+    _watcher_thread.start()
+
+    logging.info("Tray icon started")
+    icon.run()
+
+
+# ── Main ──
 
 def main():
     if len(sys.argv) > 1:
@@ -345,7 +454,7 @@ def main():
             uninstall_startup()
             return
 
-    watch()
+    run_tray()
 
 
 if __name__ == "__main__":
