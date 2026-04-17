@@ -5,7 +5,51 @@
   "font_dir": "C:/Users/2hryu/claude-test/hass-divoom/custom_components/divoom/fonts",
   "hass_divoom_path": "C:/Users/2hryu/claude-test/hass-divoom/custom_components/divoom",
   "max_text_length": 80,
-  "color_fg": [255, 255, 255],
-  "color_bg": [0, 0, 0],
-  "brightness": 100
+  "color_fg": [
+    255,
+    255,
+    255
+  ],
+  "color_bg": [
+    0,
+    0,
+    0
+  ],
+  "brightness": 100,
+  "watchers": [
+    {
+      "name": "KakaoTalk",
+      "enabled": true,
+      "detect_method": "shadow_wnd",
+      "window_title": "카카오톡",
+      "window_class": "EVA_Window_Dblclk",
+      "shadow_class": "KakaoTalkShadowWndClass",
+      "image": "kakao.bmp",
+      "keyboard_effect": 2,
+      "cooldown": 10,
+      "repeat_interval": 10
+    },
+    {
+      "name": "Claude Desktop",
+      "enabled": true,
+      "detect_method": "toast_db",
+      "handler_id": 404,
+      "image": "claude.bmp",
+      "keyboard_effect": null,
+      "cooldown": 10,
+      "display_seconds": 5
+    },
+    {
+      "name": "Antigravity",
+      "enabled": true,
+      "detect_method": "window_create",
+      "window_title": "Antigravity",
+      "window_class": "Chrome_WidgetWin_1",
+      "exe_name": "Antigravity.exe",
+      "image": "default_notify.bmp",
+      "keyboard_effect": null,
+      "cooldown": 10,
+      "display_seconds": 5
+    }
+  ]
 }

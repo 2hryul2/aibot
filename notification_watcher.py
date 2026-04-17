@@ -1,10 +1,10 @@
 """Windows Notification Watcher for Ditoo Pro.
 
-Monitors:
-1. Claude Desktop — via Windows notification DB polling (wpndatabase.db)
-2. KakaoTalk — via PID-scoped SetWinEventHook (KakaoTalkShadowWndClass CREATE)
+Config-driven notification monitoring with system tray icon.
 
-Runs as a system tray icon with right-click menu (Start/Stop/Quit).
+Supports two detection methods (set in config.json "watchers"):
+  - "shadow_wnd": PID-scoped SetWinEventHook for a specific window class
+  - "toast_db":   Windows notification DB polling (wpndatabase.db)
 
 Usage:
   python notification_watcher.py            Run with tray icon
@@ -14,6 +14,7 @@ Usage:
 
 import ctypes
 import ctypes.wintypes
+import json
 import os
 import sys
 import time
@@ -30,19 +31,8 @@ from PIL import Image
 
 user32 = ctypes.windll.user32
 
-# ── Config ──
-CLAUDE_POLL_INTERVAL = 3  # seconds
-DITOO_DISPLAY_SECONDS = 5
-COOLDOWN_SECONDS = 10
-
-# Claude Desktop
-CLAUDE_HANDLER_ID = 404
-
-# KakaoTalk
-KAKAO_WINDOW_CLASS = "EVA_Window_Dblclk"
-KAKAO_SHADOW_CLASS = "KakaoTalkShadowWndClass"
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 DB_PATH = os.path.join(
     os.environ.get("LOCALAPPDATA", ""),
     "Microsoft", "Windows", "Notifications", "wpndatabase.db",
@@ -78,6 +68,30 @@ _watcher_running = False
 _watcher_thread = None
 _stop_event = threading.Event()
 
+
+# ── Config ──
+
+def load_watcher_config():
+    """Load config.json and return full config dict."""
+    with open(CONFIG_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_watcher_config(config):
+    """Save config dict back to config.json."""
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def get_watchers(config=None):
+    """Get the watchers list from config."""
+    if config is None:
+        config = load_watcher_config()
+    return config.get("watchers", [])
+
+
+# ── Startup registration ──
 
 def _get_pythonw():
     """Get pythonw.exe path (no console window) from current Python."""
@@ -131,35 +145,83 @@ def uninstall_startup():
         print(f"Failed: {e}")
 
 
-# ── Claude Desktop: notification DB polling ──
+# ── Toast DB detection ──
 
-def get_latest_claude_notification_id():
-    """Read the latest Claude notification ID from wpndatabase.db."""
-    tmp = os.path.join(tempfile.gettempdir(), "wpn_ditoo_copy.db")
+def get_latest_toast_notification(handler_id):
+    """Read the latest toast notification ID from wpndatabase.db.
+
+    WAL 모드 DB이므로 .db/.db-wal/.db-shm 3파일을 모두 복사해야 정상 읽기 가능.
+    복사 실패 시 read-only 직접 접근으로 fallback.
+    """
+    tmp_dir = os.path.join(tempfile.gettempdir(), "wpn_ditoo_copy")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_db = os.path.join(tmp_dir, "wpndatabase.db")
+
     try:
-        shutil.copy2(DB_PATH, tmp)
-        conn = sqlite3.connect(tmp)
+        # WAL 모드: .db + .db-wal + .db-shm 모두 복사
+        for ext in ("", "-wal", "-shm"):
+            src = DB_PATH + ext
+            dst = tmp_db + ext
+            try:
+                shutil.copy2(src, dst)
+            except FileNotFoundError:
+                pass
+
+        conn = sqlite3.connect(tmp_db)
         row = conn.execute(
             "SELECT Id, ArrivalTime FROM Notification "
             "WHERE HandlerId = ? AND Type = 'toast' "
             "ORDER BY ArrivalTime DESC LIMIT 1",
-            (CLAUDE_HANDLER_ID,),
+            (handler_id,),
         ).fetchone()
         conn.close()
         return row
-    except Exception as e:
-        logging.error(f"DB read error: {e}")
-        return None
-    finally:
+    except Exception:
+        # Fallback: read-only 직접 접근
         try:
-            os.remove(tmp)
-        except Exception:
-            pass
+            uri = f"file:{DB_PATH}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+            conn.execute("PRAGMA query_only = ON")
+            row = conn.execute(
+                "SELECT Id, ArrivalTime FROM Notification "
+                "WHERE HandlerId = ? AND Type = 'toast' "
+                "ORDER BY ArrivalTime DESC LIMIT 1",
+                (handler_id,),
+            ).fetchone()
+            conn.close()
+            return row
+        except Exception as e:
+            logging.error(f"DB read error: {e}")
+            return None
+    finally:
+        for ext in ("", "-wal", "-shm"):
+            try:
+                os.remove(tmp_db + ext)
+            except Exception:
+                pass
+
+
+# ── Window PID finder ──
+
+def find_window_pid(window_title):
+    """Find a window by title substring and return its PID."""
+    result = []
+
+    def cb(hwnd, _):
+        if win32gui.IsWindowVisible(hwnd):
+            title = win32gui.GetWindowText(hwnd)
+            if window_title in title:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                result.append(pid)
+        return True
+
+    win32gui.EnumWindows(cb, None)
+    return result[0] if result else None
 
 
 # ── Ditoo display ──
 
-def send_to_ditoo(image_name, display_seconds=DITOO_DISPLAY_SECONDS):
+def send_to_ditoo(image_name, display_seconds=5, keyboard_effect=None):
     """Send image to Ditoo, wait, revert to clock."""
     try:
         sys.path.insert(0, SCRIPT_DIR)
@@ -169,6 +231,14 @@ def send_to_ditoo(image_name, display_seconds=DITOO_DISPLAY_SECONDS):
         device = get_device(config)
         image_path = os.path.join(SCRIPT_DIR, image_name)
         send_image(device, image_path, config)
+
+        if keyboard_effect is not None:
+            device.send_keyboard(0)  # toggle on
+            time.sleep(0.1)
+            for _ in range(keyboard_effect):
+                device.send_keyboard(1)
+                time.sleep(0.1)
+
         device.disconnect()
         logging.info(f"Ditoo: {image_name} sent ({display_seconds}s)")
 
@@ -177,6 +247,10 @@ def send_to_ditoo(image_name, display_seconds=DITOO_DISPLAY_SECONDS):
         config = load_config()
         device = get_device(config)
         send_clock(device, style=0)
+
+        if keyboard_effect is not None:
+            device.send_keyboard(0)  # toggle off
+
         device.disconnect()
         logging.info("Ditoo: clock restored")
 
@@ -244,126 +318,276 @@ def send_to_ditoo_until_checked(image_name, check_window_class, interval=10, key
         logging.error(f"Ditoo repeat failed: {e}")
 
 
-# ── KakaoTalk: PID-scoped ShadowWnd detection ──
+# ── Shadow WND watcher (generic) ──
 
-_kakao_last_notify = 0
+def create_shadow_wnd_callback(watchers_by_shadow):
+    """Create a WinEvent callback that dispatches to the correct watcher config."""
+    last_notify = {}
+
+    def callback(hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
+        try:
+            if not hwnd:
+                return
+            cls = win32gui.GetClassName(hwnd)
+            if cls not in watchers_by_shadow:
+                return
+
+            watcher = watchers_by_shadow[cls]
+            name = watcher["name"]
+            cooldown = watcher.get("cooldown", 10)
+
+            now = time.time()
+            if now - last_notify.get(name, 0) < cooldown:
+                return
+
+            last_notify[name] = now
+            logging.info(f"{name}: {cls} CREATE detected (new notification)")
+
+            image = watcher.get("image")
+            window_class = watcher.get("window_class")
+            keyboard_effect = watcher.get("keyboard_effect")
+            interval = watcher.get("repeat_interval", 10)
+
+            if window_class:
+                threading.Thread(
+                    target=send_to_ditoo_until_checked,
+                    args=(image, window_class),
+                    kwargs={"interval": interval, "keyboard_effect": keyboard_effect},
+                    daemon=True,
+                ).start()
+            else:
+                display_seconds = watcher.get("display_seconds", 5)
+                threading.Thread(
+                    target=send_to_ditoo,
+                    args=(image,),
+                    kwargs={"display_seconds": display_seconds, "keyboard_effect": keyboard_effect},
+                    daemon=True,
+                ).start()
+
+        except Exception:
+            pass
+
+    return callback
 
 
-def find_kakao_pid():
-    """Find KakaoTalk main window and return its PID."""
-    result = []
+# ── Toast DB watcher (generic) ──
 
-    def cb(hwnd, _):
-        if win32gui.IsWindowVisible(hwnd):
-            title = win32gui.GetWindowText(hwnd)
-            if "카카오톡" in title or "KakaoTalk" in title:
-                _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                result.append(pid)
-        return True
+def toast_poll_loop(watcher):
+    """Poll toast notification DB for a specific handler."""
+    handler_id = watcher["handler_id"]
+    name = watcher["name"]
+    cooldown = watcher.get("cooldown", 10)
+    image = watcher.get("image")
+    display_seconds = watcher.get("display_seconds", 5)
+    keyboard_effect = watcher.get("keyboard_effect")
+    poll_interval = watcher.get("poll_interval", 3)
 
-    win32gui.EnumWindows(cb, None)
-    return result[0] if result else None
-
-
-def _on_win_event(hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
-    """Callback for KakaoTalk ShadowWnd CREATE event (new message notification)."""
-    global _kakao_last_notify
-    try:
-        if not hwnd:
-            return
-        cls = win32gui.GetClassName(hwnd)
-        if cls != KAKAO_SHADOW_CLASS:
-            return
-
-        now = time.time()
-        if now - _kakao_last_notify < COOLDOWN_SECONDS:
-            return
-
-        _kakao_last_notify = now
-        logging.info("KakaoTalk ShadowWnd CREATE detected (new message)")
-
-        threading.Thread(
-            target=send_to_ditoo_until_checked,
-            args=("kakao.bmp", KAKAO_WINDOW_CLASS),
-            kwargs={"interval": 10, "keyboard_effect": 2},
-            daemon=True,
-        ).start()
-
-    except Exception:
-        pass
-
-
-# ── Claude polling thread ──
-
-def claude_poll_loop():
-    """Poll Claude notification DB in a separate thread."""
-    last_claude_id = None
-    row = get_latest_claude_notification_id()
+    last_id = None
+    row = get_latest_toast_notification(handler_id)
     if row:
-        last_claude_id = row[0]
-        logging.info(f"Initial Claude notification ID: {last_claude_id}")
+        last_id = row[0]
+        logging.info(f"{name}: initial notification ID={last_id}")
 
-    last_claude_time = 0
+    last_time = 0
 
     while not _stop_event.is_set():
         now = time.time()
         try:
-            if now - last_claude_time > COOLDOWN_SECONDS:
-                row = get_latest_claude_notification_id()
+            if now - last_time > cooldown:
+                row = get_latest_toast_notification(handler_id)
                 if row:
                     nid, arrival = row
-                    if last_claude_id is not None and nid != last_claude_id:
-                        logging.info(f"New Claude notification: id={nid}")
-                        send_to_ditoo("claude.bmp")
-                        last_claude_time = time.time()
-                    last_claude_id = nid
+                    if last_id is not None and nid != last_id:
+                        logging.info(f"{name}: new notification id={nid}")
+                        send_to_ditoo(image, display_seconds=display_seconds, keyboard_effect=keyboard_effect)
+                        last_time = time.time()
+                    last_id = nid
         except Exception as e:
-            logging.error(f"Claude poll error: {e}")
+            logging.error(f"{name} poll error: {e}")
 
-        _stop_event.wait(CLAUDE_POLL_INTERVAL)
+        _stop_event.wait(poll_interval)
+
+
+# ── Generic window_create watcher ──
+
+def create_window_create_callback(watchers_by_pid):
+    """Create a WinEvent callback for generic window creation detection.
+
+    Detects new visible windows created by a monitored process while
+    its main window is NOT in the foreground (= user is not looking at it).
+    """
+    last_notify = {}
+
+    def callback(hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
+        try:
+            if not hwnd:
+                return
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if pid not in watchers_by_pid:
+                return
+
+            watcher = watchers_by_pid[pid]
+            name = watcher["name"]
+            main_class = watcher.get("window_class", "")
+            cooldown = watcher.get("cooldown", 10)
+
+            # Skip if the created window IS the main window
+            cls = win32gui.GetClassName(hwnd)
+            if cls == main_class:
+                return
+
+            # Skip if the main window is foreground (user is looking at it)
+            fg = user32.GetForegroundWindow()
+            try:
+                fg_class = win32gui.GetClassName(fg)
+                if fg_class == main_class:
+                    return
+            except Exception:
+                pass
+
+            now = time.time()
+            if now - last_notify.get(name, 0) < cooldown:
+                return
+
+            last_notify[name] = now
+            logging.info(f"{name}: new window created (class={cls}, generic detection)")
+
+            image = watcher.get("image", "default_notify.bmp")
+            keyboard_effect = watcher.get("keyboard_effect")
+            display_seconds = watcher.get("display_seconds", 5)
+
+            if main_class:
+                interval = watcher.get("repeat_interval", 10)
+                threading.Thread(
+                    target=send_to_ditoo_until_checked,
+                    args=(image, main_class),
+                    kwargs={"interval": interval, "keyboard_effect": keyboard_effect},
+                    daemon=True,
+                ).start()
+            else:
+                threading.Thread(
+                    target=send_to_ditoo,
+                    args=(image,),
+                    kwargs={"display_seconds": display_seconds, "keyboard_effect": keyboard_effect},
+                    daemon=True,
+                ).start()
+
+        except Exception:
+            pass
+
+    return callback
 
 
 # ── Watcher core ──
 
 def _watcher_main():
-    """Run Claude DB polling + KakaoTalk event hook in a thread."""
+    """Run all watchers from config."""
     global _watcher_running
 
     logging.info("Notification watcher started")
     _watcher_running = True
 
-    kakao_pid = find_kakao_pid()
-    if kakao_pid:
-        logging.info(f"KakaoTalk PID={kakao_pid}")
-    else:
-        logging.warning("KakaoTalk not found at startup")
+    config = load_watcher_config()
+    watchers = config.get("watchers", [])
 
-    claude_thread = threading.Thread(target=claude_poll_loop, daemon=True)
-    claude_thread.start()
+    # Separate watchers by type
+    shadow_watchers = {}       # shadow_class -> watcher config
+    shadow_pids = {}           # pid -> [shadow_classes]
+    window_create_pids = {}    # pid -> watcher config
+    toast_watchers = []
+    hooks = []
+    # Keep callback references alive to prevent GC
+    _callbacks = []
 
-    cb = WINEVENTPROC(_on_win_event)
-    hook = None
-    if kakao_pid:
-        hook = user32.SetWinEventHook(
-            EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE,
-            0, cb, kakao_pid, 0,
-            WINEVENT_OUTOFCONTEXT,
-        )
-        if hook:
-            logging.info(f"KakaoTalk event hook installed (PID={kakao_pid})")
-        else:
-            logging.error("Failed to install KakaoTalk event hook")
+    for w in watchers:
+        if not w.get("enabled", True):
+            logging.info(f"{w['name']}: disabled, skipping")
+            continue
 
+        method = w.get("detect_method")
+
+        if method == "shadow_wnd":
+            shadow_class = w.get("shadow_class")
+            window_title = w.get("window_title", "")
+            if not shadow_class:
+                logging.warning(f"{w['name']}: no shadow_class, skipping")
+                continue
+
+            pid = find_window_pid(window_title)
+            if pid:
+                shadow_watchers[shadow_class] = w
+                if pid not in shadow_pids:
+                    shadow_pids[pid] = []
+                shadow_pids[pid].append(shadow_class)
+                logging.info(f"{w['name']}: PID={pid}, monitoring {shadow_class}")
+            else:
+                logging.warning(f"{w['name']}: window '{window_title}' not found")
+
+        elif method == "window_create":
+            window_title = w.get("window_title", "")
+            pid = find_window_pid(window_title)
+            if pid:
+                window_create_pids[pid] = w
+                logging.info(f"{w['name']}: PID={pid}, generic window_create monitoring")
+            else:
+                logging.warning(f"{w['name']}: window '{window_title}' not found")
+
+        elif method == "toast_db":
+            toast_watchers.append(w)
+            logging.info(f"{w['name']}: toast DB polling (handler_id={w.get('handler_id')})")
+
+    # Install shadow_wnd hooks (one per PID)
+    if shadow_watchers:
+        cb_func = create_shadow_wnd_callback(shadow_watchers)
+        cb = WINEVENTPROC(cb_func)
+        _callbacks.append(cb)
+        for pid in shadow_pids:
+            hook = user32.SetWinEventHook(
+                EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE,
+                0, cb, pid, 0,
+                WINEVENT_OUTOFCONTEXT,
+            )
+            if hook:
+                hooks.append(hook)
+                logging.info(f"Shadow hook installed: PID={pid}")
+            else:
+                logging.error(f"Failed to install shadow hook for PID={pid}")
+
+    # Install window_create hooks (one per PID)
+    if window_create_pids:
+        wc_func = create_window_create_callback(window_create_pids)
+        wc_cb = WINEVENTPROC(wc_func)
+        _callbacks.append(wc_cb)
+        for pid in window_create_pids:
+            hook = user32.SetWinEventHook(
+                EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE,
+                0, wc_cb, pid, 0,
+                WINEVENT_OUTOFCONTEXT,
+            )
+            if hook:
+                hooks.append(hook)
+                logging.info(f"Window create hook installed: PID={pid}")
+            else:
+                logging.error(f"Failed to install window_create hook for PID={pid}")
+
+    # Start toast DB pollers
+    for w in toast_watchers:
+        t = threading.Thread(target=toast_poll_loop, args=(w,), daemon=True)
+        t.start()
+
+    # Message pump
     msg = ctypes.wintypes.MSG()
     while not _stop_event.is_set():
-        # PeekMessage with PM_REMOVE to avoid blocking forever
         if user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, 0x0001):
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
         else:
             time.sleep(0.1)
 
-    if hook:
+    for hook in hooks:
         user32.UnhookWinEvent(hook)
     _watcher_running = False
     logging.info("Watcher stopped")
@@ -372,11 +596,10 @@ def _watcher_main():
 # ── Tray icon ──
 
 def _create_tray_icon():
-    """Create tray icon image (16x16 orange circle)."""
+    """Create tray icon image."""
     icon_path = os.path.join(SCRIPT_DIR, "claude_icon.png")
     if os.path.isfile(icon_path):
         return Image.open(icon_path).resize((64, 64), Image.Resampling.NEAREST)
-    # Fallback: generate simple icon
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     from PIL import ImageDraw
     draw = ImageDraw.Draw(img)
@@ -405,6 +628,29 @@ def _on_stop(icon, item):
     logging.info("Watcher stopped via tray")
 
 
+def _on_config(icon, item):
+    """Open Config GUI."""
+    import subprocess
+    subprocess.Popen(
+        [sys.executable, os.path.join(SCRIPT_DIR, "config_gui.py")],
+        cwd=SCRIPT_DIR,
+    )
+    logging.info("Config GUI opened")
+
+
+def _on_reload(icon, item):
+    """Stop and restart watcher with updated config."""
+    global _watcher_thread
+    if _watcher_running:
+        _stop_event.set()
+        time.sleep(1)
+    _stop_event.clear()
+    _watcher_thread = threading.Thread(target=_watcher_main, daemon=True)
+    _watcher_thread.start()
+    icon.notify("Config reloaded", "Ditoo Notifier")
+    logging.info("Watcher reloaded via tray")
+
+
 def _on_quit(icon, item):
     """Quit the app."""
     _stop_event.set()
@@ -415,6 +661,22 @@ def _on_quit(icon, item):
 def _get_status(item):
     """Dynamic menu label showing current status."""
     return "Running" if _watcher_running else "Stopped"
+
+
+def _build_watcher_submenu():
+    """Build dynamic submenu showing watcher status."""
+    items = []
+    try:
+        watchers = get_watchers()
+        for w in watchers:
+            name = w.get("name", "Unknown")
+            enabled = w.get("enabled", True)
+            method = w.get("detect_method", "?")
+            label = f"{'[ON]' if enabled else '[OFF]'} {name} ({method})"
+            items.append(pystray.MenuItem(label, None, enabled=False))
+    except Exception:
+        items.append(pystray.MenuItem("Error loading config", None, enabled=False))
+    return items
 
 
 def run_tray():
@@ -428,6 +690,10 @@ def run_tray():
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Start", _on_start),
             pystray.MenuItem("Stop", _on_stop),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Watchers", pystray.Menu(lambda: _build_watcher_submenu())),
+            pystray.MenuItem("Config", _on_config),
+            pystray.MenuItem("Reload", _on_reload),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", _on_quit),
         ),
